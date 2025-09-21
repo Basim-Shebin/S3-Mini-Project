@@ -1,0 +1,83 @@
+import os
+import cv2
+import numpy as np
+import pytesseract
+from flask import Flask, render_template, request, send_from_directory
+from werkzeug.utils import secure_filename
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+
+# 🔹 If tesseract.exe is not in PATH, set the path manually:
+# pytesseract.pytesseract.tesseract_cmd = r"D:\Tesseract-OCR\tesseract.exe"
+
+app = Flask(__name__)
+
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
+PREVIEW_FOLDER = "static/previews"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs(PREVIEW_FOLDER, exist_ok=True)
+
+def preprocess_and_ocr(image_path):
+    """Preprocess image and run OCR"""
+    img = cv2.imread(image_path)
+
+    # Step 1: Grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray_path = os.path.join(PREVIEW_FOLDER, "gray.png")
+    cv2.imwrite(gray_path, gray)
+
+    # Step 2: Median filtering (noise reduction)
+    denoised = cv2.medianBlur(gray, 3)
+    denoised_path = os.path.join(PREVIEW_FOLDER, "denoised.png")
+    cv2.imwrite(denoised_path, denoised)
+
+    # Step 3: Otsu Thresholding
+    _, binary = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    binary_path = os.path.join(PREVIEW_FOLDER, "binary.png")
+    cv2.imwrite(binary_path, binary)
+
+    # OCR
+    text = pytesseract.image_to_string(binary)
+
+    # PDF output
+    pdf_filename = os.path.splitext(os.path.basename(image_path))[0] + ".pdf"
+    pdf_path = os.path.join(OUTPUT_FOLDER, pdf_filename)
+
+    doc = SimpleDocTemplate(pdf_path)
+    styles = getSampleStyleSheet()
+    story = [Paragraph(text, styles["Normal"])]
+    doc.build(story)
+
+    return text, pdf_filename, {
+        "gray": gray_path,
+        "denoised": denoised_path,
+        "binary": binary_path
+    }
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        if "file" not in request.files:
+            return render_template("index.html", error="No file uploaded")
+        file = request.files["file"]
+        if file.filename == "":
+            return render_template("index.html", error="No file selected")
+
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+
+        text, pdf_file, previews = preprocess_and_ocr(filepath)
+
+        return render_template("index.html", text=text, pdf_file=pdf_file, previews=previews)
+
+    return render_template("index.html")
+
+@app.route("/download/<filename>")
+def download_file(filename):
+    return send_from_directory(OUTPUT_FOLDER, filename, as_attachment=True)
+
+if __name__ == "__main__":
+    app.run(debug=True)
