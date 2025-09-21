@@ -1,0 +1,259 @@
+import os
+import sys
+import shutil
+import cv2
+import numpy as np
+from PIL import Image
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+from flask import Flask, request, send_file, render_template
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+try:
+    from fpdf import FPDF
+except ImportError:
+    FPDF = None
+
+# ------------------------------
+# 1) Upload Validation
+# ------------------------------
+@dataclass
+class ValidationConfig:
+    allowed_formats: Tuple[str, ...] = ("JPEG", "PNG")
+    allowed_exts: Tuple[str, ...] = (".jpg", ".jpeg", ".png")
+    min_filesize_kb: int = 50
+    max_filesize_mb: int = 5
+    min_width: int = 800
+    min_height: int = 600
+
+
+def validate_image(file_path: str, cfg: ValidationConfig = ValidationConfig()) -> Tuple[bool, str]:
+    if not os.path.exists(file_path):
+        return False, "File does not exist"
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in cfg.allowed_exts:
+        return False, f"Unsupported extension '{ext}'."
+
+    try:
+        with Image.open(file_path) as im:
+            fmt = im.format
+            width, height = im.size
+    except Exception as e:
+        return False, f"Unreadable image: {e}"
+
+    if fmt not in cfg.allowed_formats:
+        return False, f"Unsupported format '{fmt}'."
+
+    size_bytes = os.path.getsize(file_path)
+    if size_bytes < cfg.min_filesize_kb * 1024:
+        return False, "File too small."
+    if size_bytes > cfg.max_filesize_mb * 1024 * 1024:
+        return False, "File too large."
+
+    if width < cfg.min_width or height < cfg.min_height:
+        return False, "Resolution too low."
+
+    return True, "OK"
+
+
+# ------------------------------
+# 2) Preprocessing
+# ------------------------------
+@dataclass
+class PreprocessConfig:
+    target_width: int = 1280
+    median_ksize: int = 3
+
+
+def resize_keep_aspect(img: np.ndarray, target_width: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    if w == target_width:
+        return img
+    scale = target_width / float(w)
+    new_h = int(round(h * scale))
+    return cv2.resize(img, (target_width, new_h), interpolation=cv2.INTER_CUBIC)
+
+
+def to_grayscale(img_bgr: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+
+def median_filter(img_gray: np.ndarray, ksize: int = 3) -> np.ndarray:
+    k = max(3, int(ksize) | 1)
+    return cv2.medianBlur(img_gray, k)
+
+
+def otsu_threshold(img_gray: np.ndarray) -> np.ndarray:
+    _, th = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return th
+
+
+def preprocess_image(bgr: np.ndarray, cfg: PreprocessConfig = PreprocessConfig()) -> Dict[str, np.ndarray]:
+    out = {}
+    resized = resize_keep_aspect(bgr, cfg.target_width)
+    out["resized"] = resized
+
+    gray = to_grayscale(resized)
+    den = median_filter(gray, cfg.median_ksize)
+    bw = otsu_threshold(den)
+
+    out["gray"] = gray
+    out["denoised"] = den
+    out["binary"] = bw
+    return out
+
+
+def save_stage_images(stages: Dict[str, np.ndarray], out_dir: str = "static/previews") -> Dict[str, str]:
+    os.makedirs(out_dir, exist_ok=True)
+    saved_paths = {}
+    for name, img in stages.items():
+        path = os.path.join(out_dir, f"{name}.png")
+        cv2.imwrite(path, img)
+        saved_paths[name] = path
+    return saved_paths
+
+
+# ------------------------------
+# 3) Connected Components
+# ------------------------------
+@dataclass
+class CCAConfig:
+    connectivity: int = 8
+    min_area: int = 50
+    max_area: int = 200000
+
+
+def connected_components(bw: np.ndarray, cfg: CCAConfig = CCAConfig()) -> List[Tuple[int, int, int, int]]:
+    inv = (255 - bw)
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(inv, connectivity=cfg.connectivity)
+    boxes = []
+    for i in range(1, num_labels):
+        x, y, w, h, area = stats[i]
+        if cfg.min_area <= area <= cfg.max_area:
+            boxes.append((x, y, w, h))
+    boxes.sort(key=lambda b: (b[1] // 30, b[0]))
+    return boxes
+
+
+# ------------------------------
+# 4) OCR with Tesseract
+# ------------------------------
+@dataclass
+class OCRConfig:
+    lang: str = "eng"
+    psm: int = 6
+    oem: int = 3
+
+
+def recognize_text_tesseract(img: np.ndarray, cfg: OCRConfig = OCRConfig()) -> str:
+    if pytesseract is None:
+        raise RuntimeError("pytesseract not installed.")
+    config = f"--oem {cfg.oem} --psm {cfg.psm}"
+    text = pytesseract.image_to_string(img, lang=cfg.lang, config=config)
+    return text.strip()
+
+
+# ------------------------------
+# 5) PDF Export
+# ------------------------------
+class NotesPDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 14)
+        self.cell(0, 10, 'Whiteboard Digitalizer Notes', 0, 1, 'C')
+        self.ln(2)
+
+
+def save_as_pdf(output_path: str, extracted_text: str):
+    if FPDF is None:
+        raise RuntimeError("fpdf not installed.")
+    pdf = NotesPDF()
+    pdf.add_page()
+    pdf.set_font('Arial', size=11)
+    pdf.multi_cell(0, 6, extracted_text if extracted_text else "(No text recognized)")
+    pdf.output(output_path)
+
+
+# ------------------------------
+# Utility
+# ------------------------------
+def load_bgr(path: str) -> np.ndarray:
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Failed to read image: {path}")
+    return img
+
+
+# ------------------------------
+# Main pipeline
+# ------------------------------
+def process_whiteboard(image_path: str, out_pdf: str, tesseract_cmd: Optional[str] = None):
+    if tesseract_cmd and pytesseract is not None:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    ok, msg = validate_image(image_path)
+    if not ok:
+        raise ValueError(f"Validation failed: {msg}")
+
+    bgr = load_bgr(image_path)
+    stages = preprocess_image(bgr)
+
+    # Save preview images
+    previews = save_stage_images(stages)
+
+    binary = stages["binary"]
+    text = recognize_text_tesseract(binary)
+    save_as_pdf(out_pdf, text)
+
+    return out_pdf, text, previews
+
+
+# ------------------------------
+# Flask App
+# ------------------------------
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "output"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", text=None, previews=None, pdf_file=None)
+
+
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    if "file" not in request.files:
+        return "No file part", 400
+    file = request.files["file"]
+    if file.filename == "":
+        return "No selected file", 400
+
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
+
+    out_pdf = os.path.join(OUTPUT_FOLDER, os.path.splitext(file.filename)[0] + ".pdf")
+
+    # auto-detect tesseract
+    tesseract_path = shutil.which("tesseract")
+    if not tesseract_path:
+        tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+    pdf_path, text, previews = process_whiteboard(file_path, out_pdf, tesseract_cmd=tesseract_path)
+
+    return render_template("index.html", text=text, previews=previews, pdf_file=os.path.basename(pdf_path))
+
+
+@app.route("/download/<filename>")
+def download_file(filename):
+    return send_file(os.path.join(OUTPUT_FOLDER, filename), as_attachment=True)
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
